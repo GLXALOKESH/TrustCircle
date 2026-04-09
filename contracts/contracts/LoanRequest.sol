@@ -45,13 +45,14 @@ contract LoanRequest is Ownable {
 	mapping(uint256 => Loan)       public loans;
 	mapping(address => uint256[])  public borrowerLoans;
 	mapping(address => uint256[])  public lenderLoans;
+	mapping(uint256 => bytes32)    public disputeReasonHashes;
 
 	event LoanCreated(uint256 indexed loanId, address indexed borrower, uint256 amount);
 	event LoanFullyVouched(uint256 indexed loanId);
 	event LoanFunded(uint256 indexed loanId, address indexed lender, uint256 amount);
 	event LoanRepaid(uint256 indexed loanId, address indexed borrower, uint256 amount);
 	event DefaultClaimed(uint256 indexed loanId, address indexed lender, uint256 disputeDeadline);
-	event DefaultDisputed(uint256 indexed loanId, address indexed borrower);
+	event DefaultDisputed(uint256 indexed loanId, address indexed borrower, bytes32 reasonHash);
 	event DefaultFinalized(uint256 indexed loanId, uint256 slashedAmount);
 
 	constructor(address _vouchPool, address _reputationToken) {
@@ -69,7 +70,11 @@ contract LoanRequest is Ownable {
 		require(amount > 0, "Amount must be > 0");
 		require(termDays >= 1 && termDays <= 365, "Term: 1-365 days");
 		require(interestBps >= 100 && interestBps <= 5000, "Interest: 1%-50%");
-		require(voucherAddresses.length >= 2 && voucherAddresses.length <= 3, "2-3 vouchers required");
+		require(
+			voucherAddresses.length == 0 ||
+			(voucherAddresses.length >= 2 && voucherAddresses.length <= 3),
+			"Voucher count must be 0 or 2-3"
+		);
 
 		uint256 maxLoan = reputationToken.getMaxLoan(msg.sender);
 		require(amount <= maxLoan, "Amount exceeds trust limit");
@@ -93,14 +98,18 @@ contract LoanRequest is Ownable {
 			fundedAt:        0,
 			dueTimestamp:    0,
 			disputeDeadline: 0,
-			state:           0,
+			state:           voucherAddresses.length == 0 ? 1 : 0,
 			purpose:         purpose,
 			vouchers:        voucherAddresses
 		});
 
 		borrowerLoans[msg.sender].push(loanId);
 		reputationToken.mintIfNew(msg.sender);
-		vouchPool.registerLoan(loanId, amount, voucherAddresses);
+		if (voucherAddresses.length > 0) {
+			vouchPool.registerLoan(loanId, amount, voucherAddresses);
+		} else {
+			emit LoanFullyVouched(loanId);
+		}
 
 		emit LoanCreated(loanId, msg.sender, amount);
 		return loanId;
@@ -117,13 +126,16 @@ contract LoanRequest is Ownable {
 
 		loan.state = 3;
 
-		uint256 voucherYieldPool = (interest * 3000) / 10000;
-		(bool poolOk, ) = payable(address(vouchPool)).call{value: voucherYieldPool}("");
-		require(poolOk, "Yield transfer failed");
+		uint256 voucherYieldPool = 0;
+		if (loan.vouchers.length > 0) {
+			voucherYieldPool = (interest * 3000) / 10000;
+			(bool poolOk, ) = payable(address(vouchPool)).call{value: voucherYieldPool}("");
+			require(poolOk, "Yield transfer failed");
 
-		vouchPool.releaseStakes(loanId, interest);
+			vouchPool.releaseStakes(loanId, interest);
+		}
 
-		uint256 lenderPayout = loan.amount + ((interest * 7000) / 10000);
+		uint256 lenderPayout = loan.amount + interest - voucherYieldPool;
 		(bool ok, ) = payable(loan.lender).call{value: lenderPayout}("");
 		require(ok, "Lender payment failed");
 
@@ -139,12 +151,21 @@ contract LoanRequest is Ownable {
 	}
 
 	function disputeDefault(uint256 loanId) external {
+		_disputeDefault(loanId, bytes32(0));
+	}
+
+	function disputeDefault(uint256 loanId, bytes32 reasonHash) external {
+		_disputeDefault(loanId, reasonHash);
+	}
+
+	function _disputeDefault(uint256 loanId, bytes32 reasonHash) internal {
 		Loan storage loan = loans[loanId];
 		require(loan.borrower == msg.sender, "Not the borrower");
 		require(loan.state == 4, "No active default claim");
 		require(block.timestamp < loan.disputeDeadline, "Dispute window closed");
+		disputeReasonHashes[loanId] = reasonHash;
 		loan.state = 2;
-		emit DefaultDisputed(loanId, msg.sender);
+		emit DefaultDisputed(loanId, msg.sender, reasonHash);
 	}
 
 	function fundLoan(uint256 loanId) external payable {
