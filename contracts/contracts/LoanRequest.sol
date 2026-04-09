@@ -117,6 +117,10 @@ contract LoanRequest is Ownable {
 
 		loan.state = 3;
 
+		uint256 voucherYieldPool = (interest * 3000) / 10000;
+		(bool poolOk, ) = payable(address(vouchPool)).call{value: voucherYieldPool}("");
+		require(poolOk, "Yield transfer failed");
+
 		vouchPool.releaseStakes(loanId, interest);
 
 		uint256 lenderPayout = loan.amount + ((interest * 7000) / 10000);

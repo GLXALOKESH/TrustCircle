@@ -42,6 +42,8 @@ contract VouchPool is Ownable {
         reputationToken = IReputationToken(_reputationToken);
     }
 
+    receive() external payable {}
+
     modifier onlyLoanContract() {
         require(msg.sender == loanRequestContract, "Only LoanRequest");
         _;
