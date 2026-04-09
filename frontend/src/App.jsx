@@ -2,6 +2,7 @@ import { useState } from 'react'
 import reactLogo from './assets/react.svg'
 import viteLogo from './assets/vite.svg'
 import heroImg from './assets/hero.png'
+import { UserButton } from '@civic/auth-web3/react'
 import './App.css'
 
 function App() {
@@ -9,6 +10,16 @@ function App() {
 
   return (
     <>
+      <header className="app-header">
+        <div className="logo-section">
+          <img src={viteLogo} className="logo-small" alt="TrustCircle logo" />
+          <span className="brand-name">TrustCircle</span>
+        </div>
+        <div className="auth-section">
+          <UserButton />
+        </div>
+      </header>
+
       <section id="center">
         <div className="hero">
           <img src={heroImg} className="base" width="170" height="179" alt="" />
