@@ -1,0 +1,1678 @@
+=============================================================
+  AGENTS.txt — TrustCircle
+  Social-Vouched Decentralised Micro-Lending Platform
+  Complete build instructions for AI coding agents
+=============================================================
+
+READ THIS ENTIRE FILE BEFORE WRITING A SINGLE LINE OF CODE.
+This file is the single source of truth. Every decision —
+architecture, naming, design, blockchain logic — is defined
+here. Do not deviate. Do not improvise. Follow exactly.
+
+-------------------------------------------------------------
+SECTION 0 — WHAT IS TRUSTCIRCLE
+-------------------------------------------------------------
+
+TrustCircle is a decentralised lending platform where
+borrowers do not need crypto assets as collateral. Instead,
+people from their social network ("vouchers") stake ETH on
+their behalf. If the borrower repays, vouchers get their
+stake back plus a yield. If the borrower defaults, vouchers
+lose their stake and both borrower and voucher reputations
+are permanently damaged on-chain.
+
+The platform has three user roles:
+  - Borrower  : requests loans, repays them
+  - Voucher   : stakes ETH on behalf of a borrower
+  - Lender    : funds fully-vouched loans, earns interest
+
+Everything runs on the Ethereum Sepolia testnet. There is no
+traditional backend. No Express server. No database. All
+state lives in smart contracts on the blockchain.
+
+-------------------------------------------------------------
+SECTION 1 — MONOREPO STRUCTURE
+-------------------------------------------------------------
+
+Create the following folder structure exactly:
+
+  trustcircle/
+  ├── contracts/          (Hardhat project)
+  └── frontend/           (React + Vite project)
+
+Do not merge them. Do not add a backend folder.
+
+-------------------------------------------------------------
+SECTION 2 — CONTRACTS PROJECT SETUP
+-------------------------------------------------------------
+
+STEP 1: Initialise the contracts project
+
+  cd trustcircle/contracts
+  npm init -y
+  npm install --save-dev hardhat @nomicfoundation/hardhat-toolbox
+  npm install @openzeppelin/contracts
+  npx hardhat init   (select: Create a JavaScript project)
+
+STEP 2: hardhat.config.js
+
+  Replace the generated hardhat.config.js with exactly this:
+
+  require("@nomicfoundation/hardhat-toolbox");
+  require("dotenv").config();
+
+  module.exports = {
+    solidity: "0.8.20",
+    networks: {
+      sepolia: {
+        url: process.env.SEPOLIA_RPC_URL,
+        accounts: [process.env.DEPLOYER_PRIVATE_KEY]
+      }
+    }
+  };
+
+STEP 3: .env file in contracts/
+
+  SEPOLIA_RPC_URL=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
+  DEPLOYER_PRIVATE_KEY=your_wallet_private_key_here
+
+  NOTE FOR AGENT: Never commit this file. Add .env to
+  .gitignore immediately.
+
+-------------------------------------------------------------
+SECTION 3 — SMART CONTRACT 1: ReputationToken.sol
+-------------------------------------------------------------
+
+File: contracts/contracts/ReputationToken.sol
+
+PURPOSE: A soulbound (non-transferable) ERC-721 NFT that
+tracks every wallet's borrowing and vouching history.
+One token per wallet. Cannot be transferred. Cannot be
+burned. Cannot be reset. This is the identity layer.
+
+WRITE THIS CONTRACT EXACTLY:
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+contract ReputationToken is ERC721, Ownable {
+
+    uint256 private _tokenIdCounter;
+
+    struct Profile {
+        uint256 repaymentCount;
+        uint256 defaultCount;
+        uint256 totalBorrowed;      // in wei
+        uint256 totalRepaid;        // in wei
+        uint256 vouchCount;
+        uint256 successfulVouches;
+        uint256 mintedAt;
+    }
+
+    mapping(address => uint256) public addressToTokenId;
+    mapping(uint256 => Profile) public profiles;
+
+    // Only these addresses can call update functions
+    address public loanRequestContract;
+    address public vouchPoolContract;
+
+    event ScoreUpdated(address indexed wallet, uint8 eventType);
+    // eventType: 1=repayment, 2=default, 3=vouch_success, 4=vouch_slash
+
+    constructor() ERC721("TrustCircle Reputation", "TCREP") Ownable(msg.sender) {}
+
+    function setAuthorisedContracts(
+        address _loanRequest,
+        address _vouchPool
+    ) external onlyOwner {
+        loanRequestContract = _loanRequest;
+        vouchPoolContract   = _vouchPool;
+    }
+
+    modifier onlyAuthorised() {
+        require(
+            msg.sender == loanRequestContract ||
+            msg.sender == vouchPoolContract   ||
+            msg.sender == owner(),
+            "Not authorised"
+        );
+        _;
+    }
+
+    // Mint a token for a wallet if they don't have one yet.
+    // Called automatically when a borrower creates their first loan.
+    function mintIfNew(address wallet) external onlyAuthorised {
+        if (balanceOf(wallet) == 0) {
+            _tokenIdCounter++;
+            uint256 newId = _tokenIdCounter;
+            _safeMint(wallet, newId);
+            addressToTokenId[wallet] = newId;
+            profiles[newId].mintedAt = block.timestamp;
+        }
+    }
+
+    function recordRepayment(address wallet, uint256 amount) external onlyAuthorised {
+        uint256 id = addressToTokenId[wallet];
+        require(id != 0, "No token");
+        profiles[id].repaymentCount++;
+        profiles[id].totalRepaid += amount;
+        emit ScoreUpdated(wallet, 1);
+    }
+
+    function recordDefault(address wallet, uint256 amount) external onlyAuthorised {
+        uint256 id = addressToTokenId[wallet];
+        require(id != 0, "No token");
+        profiles[id].defaultCount++;
+        profiles[id].totalBorrowed += amount;
+        emit ScoreUpdated(wallet, 2);
+    }
+
+    function recordBorrow(address wallet, uint256 amount) external onlyAuthorised {
+        uint256 id = addressToTokenId[wallet];
+        require(id != 0, "No token");
+        profiles[id].totalBorrowed += amount;
+    }
+
+    function recordVouchSuccess(address voucher) external onlyAuthorised {
+        uint256 id = addressToTokenId[voucher];
+        if (id == 0) return;
+        profiles[id].vouchCount++;
+        profiles[id].successfulVouches++;
+        emit ScoreUpdated(voucher, 3);
+    }
+
+    function recordVouchSlash(address voucher) external onlyAuthorised {
+        uint256 id = addressToTokenId[voucher];
+        if (id == 0) return;
+        profiles[id].vouchCount++;
+        emit ScoreUpdated(voucher, 4);
+    }
+
+    // Returns a score from 0 to 100.
+    // Formula: (repayments * 8) + (repayRatio * 30) - (defaults * 25) + (voucherAccuracy * 10)
+    // Clamped between 0 and 100.
+    function getScore(address wallet) external view returns (uint256) {
+        uint256 id = addressToTokenId[wallet];
+        if (id == 0) return 0;
+        Profile memory p = profiles[id];
+
+        uint256 score = 0;
+
+        // Repayment count component (max ~40 at 5 repayments)
+        uint256 repayComp = p.repaymentCount * 8;
+        if (repayComp > 40) repayComp = 40;
+        score += repayComp;
+
+        // Repay ratio component (max 30)
+        if (p.totalBorrowed > 0) {
+            uint256 ratio = (p.totalRepaid * 100) / p.totalBorrowed;
+            score += (ratio * 30) / 100;
+        }
+
+        // Default penalty
+        uint256 penalty = p.defaultCount * 25;
+        if (penalty >= score) return 0;
+        score -= penalty;
+
+        // Voucher accuracy component (max 10)
+        if (p.vouchCount > 0) {
+            uint256 accuracy = (p.successfulVouches * 100) / p.vouchCount;
+            score += (accuracy * 10) / 100;
+        }
+
+        if (score > 100) score = 100;
+        return score;
+    }
+
+    // Returns max loan allowed in wei based on score
+    function getMaxLoan(address wallet) external view returns (uint256) {
+        uint256 id = addressToTokenId[wallet];
+        uint256 score = 0;
+        if (id != 0) {
+            // Call internal logic inline to avoid external call cost
+            Profile memory p = profiles[id];
+            uint256 s = p.repaymentCount * 8;
+            if (s > 40) s = 40;
+            if (p.totalBorrowed > 0) s += ((p.totalRepaid * 100) / p.totalBorrowed * 30) / 100;
+            uint256 pen = p.defaultCount * 25;
+            s = pen >= s ? 0 : s - pen;
+            if (p.vouchCount > 0) s += ((p.successfulVouches * 100) / p.vouchCount * 10) / 100;
+            if (s > 100) s = 100;
+            score = s;
+        }
+
+        if (score == 0)      return 0.05 ether;
+        if (score <= 20)     return 0.2 ether;
+        if (score <= 50)     return 0.5 ether;
+        return 1 ether;
+    }
+
+    function getProfile(address wallet) external view returns (Profile memory) {
+        uint256 id = addressToTokenId[wallet];
+        return profiles[id];
+    }
+
+    // SOULBOUND: Override all transfer functions to revert
+    function transferFrom(address, address, uint256) public pure override {
+        revert("Soulbound: non-transferable");
+    }
+
+    function safeTransferFrom(address, address, uint256, bytes memory) public pure override {
+        revert("Soulbound: non-transferable");
+    }
+}
+
+-------------------------------------------------------------
+SECTION 4 — SMART CONTRACT 2: VouchPool.sol
+-------------------------------------------------------------
+
+File: contracts/contracts/VouchPool.sol
+
+PURPOSE: Holds voucher stakes in escrow. Releases stakes on
+repayment (with yield). Slashes stakes on default. Enforces
+minimum stake coverage of 80% of the loan amount total across
+all vouchers.
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+interface IReputationToken {
+    function recordVouchSuccess(address voucher) external;
+    function recordVouchSlash(address voucher) external;
+    function mintIfNew(address wallet) external;
+}
+
+contract VouchPool is Ownable {
+
+    address public loanRequestContract;
+    IReputationToken public reputationToken;
+
+    struct VoucherInfo {
+        address wallet;
+        uint256 stakeAmount;
+        bool    hasStaked;
+    }
+
+    // loanId => list of vouchers
+    mapping(uint256 => VoucherInfo[]) public vouchersByLoan;
+    // loanId => total staked
+    mapping(uint256 => uint256) public totalStaked;
+    // loanId => list of invited voucher addresses
+    mapping(uint256 => address[]) public invitedVouchers;
+    // loanId => address => index in vouchersByLoan (1-based, 0 = not staked)
+    mapping(uint256 => mapping(address => uint256)) private voucherIndex;
+    // loanId => loan amount (set by LoanRequest when loan is created)
+    mapping(uint256 => uint256) public loanAmounts;
+    // voucher => array of loanIds they are staked on
+    mapping(address => uint256[]) public stakesByVoucher;
+
+    // Minimum total stake as a percentage of loan amount (80%)
+    uint256 public constant MIN_COVERAGE_BPS = 8000; // 80% in basis points
+
+    // Yield paid to vouchers as % of interest earned
+    // 30% of the interest goes to vouchers, split proportionally
+    uint256 public constant VOUCHER_YIELD_SHARE_BPS = 3000;
+
+    event VouchRequested(uint256 indexed loanId, address indexed voucher);
+    event Staked(uint256 indexed loanId, address indexed voucher, uint256 amount);
+    event StakeReleased(uint256 indexed loanId, address indexed voucher, uint256 stake, uint256 yield);
+    event StakeSlashed(uint256 indexed loanId, address indexed voucher, uint256 amount);
+
+    constructor(address _reputationToken) Ownable(msg.sender) {
+        reputationToken = IReputationToken(_reputationToken);
+    }
+
+    modifier onlyLoanContract() {
+        require(msg.sender == loanRequestContract, "Only LoanRequest");
+        _;
+    }
+
+    function setLoanRequestContract(address _addr) external onlyOwner {
+        loanRequestContract = _addr;
+    }
+
+    // Called by LoanRequest when a loan is created
+    function registerLoan(
+        uint256 loanId,
+        uint256 loanAmount,
+        address[] calldata vouchers
+    ) external onlyLoanContract {
+        loanAmounts[loanId]    = loanAmount;
+        invitedVouchers[loanId] = vouchers;
+        for (uint i = 0; i < vouchers.length; i++) {
+            emit VouchRequested(loanId, vouchers[i]);
+        }
+    }
+
+    // Called by a voucher to stake ETH on a loan
+    function stake(uint256 loanId) external payable {
+        require(msg.value > 0, "Must send ETH");
+        bool isInvited = false;
+        address[] memory invited = invitedVouchers[loanId];
+        for (uint i = 0; i < invited.length; i++) {
+            if (invited[i] == msg.sender) { isInvited = true; break; }
+        }
+        require(isInvited, "Not invited as voucher");
+        require(voucherIndex[loanId][msg.sender] == 0, "Already staked");
+
+        vouchersByLoan[loanId].push(VoucherInfo({
+            wallet: msg.sender,
+            stakeAmount: msg.value,
+            hasStaked: true
+        }));
+        voucherIndex[loanId][msg.sender] = vouchersByLoan[loanId].length; // 1-based
+        totalStaked[loanId] += msg.value;
+        stakesByVoucher[msg.sender].push(loanId);
+
+        // Mint reputation NFT for voucher if they don't have one
+        reputationToken.mintIfNew(msg.sender);
+
+        emit Staked(loanId, msg.sender, msg.value);
+    }
+
+    // Returns true if total staked >= 80% of loan amount
+    function isSufficientlyCovered(uint256 loanId) external view returns (bool) {
+        uint256 required = (loanAmounts[loanId] * MIN_COVERAGE_BPS) / 10000;
+        return totalStaked[loanId] >= required;
+    }
+
+    function getVouchers(uint256 loanId) external view returns (VoucherInfo[] memory) {
+        return vouchersByLoan[loanId];
+    }
+
+    function getTotalStaked(uint256 loanId) external view returns (uint256) {
+        return totalStaked[loanId];
+    }
+
+    // Called by LoanRequest on successful repayment.
+    // interestAmount = total interest paid by borrower
+    // Returns ETH stake + proportional yield to each voucher.
+    function releaseStakes(uint256 loanId, uint256 interestAmount) external onlyLoanContract {
+        VoucherInfo[] storage vouchers = vouchersByLoan[loanId];
+        uint256 totalStake = totalStaked[loanId];
+        uint256 yieldPool  = (interestAmount * VOUCHER_YIELD_SHARE_BPS) / 10000;
+
+        for (uint i = 0; i < vouchers.length; i++) {
+            VoucherInfo storage v = vouchers[i];
+            if (!v.hasStaked) continue;
+
+            uint256 voucherYield = totalStake > 0
+                ? (yieldPool * v.stakeAmount) / totalStake
+                : 0;
+
+            uint256 payout = v.stakeAmount + voucherYield;
+            v.hasStaked = false;
+            reputationToken.recordVouchSuccess(v.wallet);
+
+            (bool ok, ) = payable(v.wallet).call{value: payout}("");
+            require(ok, "Transfer failed");
+            emit StakeReleased(loanId, v.wallet, v.stakeAmount, voucherYield);
+        }
+    }
+
+    // Called by LoanRequest on default finalisation.
+    // All voucher stakes are sent to the lender.
+    function slashStakes(uint256 loanId, address payable lender) external onlyLoanContract returns (uint256) {
+        VoucherInfo[] storage vouchers = vouchersByLoan[loanId];
+        uint256 slashed = 0;
+
+        for (uint i = 0; i < vouchers.length; i++) {
+            VoucherInfo storage v = vouchers[i];
+            if (!v.hasStaked) continue;
+            uint256 amount = v.stakeAmount;
+            v.hasStaked = false;
+            slashed += amount;
+            reputationToken.recordVouchSlash(v.wallet);
+            emit StakeSlashed(loanId, v.wallet, amount);
+        }
+
+        if (slashed > 0) {
+            (bool ok, ) = lender.call{value: slashed}("");
+            require(ok, "Slash transfer failed");
+        }
+        return slashed;
+    }
+
+    // View: get all loanIds a voucher is staked on
+    function getStakesByVoucher(address voucher) external view returns (uint256[] memory) {
+        return stakesByVoucher[voucher];
+    }
+}
+
+-------------------------------------------------------------
+SECTION 5 — SMART CONTRACT 3: LoanRequest.sol
+-------------------------------------------------------------
+
+File: contracts/contracts/LoanRequest.sol
+
+PURPOSE: The main contract. Manages the full lifecycle of
+every loan. Orchestrates VouchPool and ReputationToken.
+This is the contract the frontend interacts with most.
+
+STATE MACHINE:
+  0 = Pending        (created, waiting for vouchers to stake)
+  1 = FullyVouched   (total stake >= 80% of loan, ready for lender)
+  2 = Funded         (lender funded it, ETH sent to borrower)
+  3 = Repaid         (borrower repaid, done)
+  4 = DefaultClaimed (lender called claimDefault, 48hr window open)
+  5 = Defaulted      (finalized, stakes slashed)
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/access/Ownable.sol";
+
+interface IVouchPool {
+    function registerLoan(uint256, uint256, address[] calldata) external;
+    function isSufficientlyCovered(uint256) external view returns (bool);
+    function releaseStakes(uint256, uint256) external;
+    function slashStakes(uint256, address payable) external returns (uint256);
+    function getTotalStaked(uint256) external view returns (uint256);
+}
+
+interface IReputationToken {
+    function mintIfNew(address) external;
+    function recordRepayment(address, uint256) external;
+    function recordDefault(address, uint256) external;
+    function recordBorrow(address, uint256) external;
+    function getMaxLoan(address) external view returns (uint256);
+}
+
+contract LoanRequest is Ownable {
+
+    IVouchPool         public vouchPool;
+    IReputationToken   public reputationToken;
+
+    uint256 private _loanCounter;
+
+    // Interest rate is stored as basis points (bps): 1000 bps = 10%
+    struct Loan {
+        uint256 id;
+        address borrower;
+        address lender;
+        uint256 amount;          // in wei
+        uint256 termDays;
+        uint256 interestBps;     // e.g. 1000 = 10%
+        uint256 createdAt;
+        uint256 fundedAt;
+        uint256 dueTimestamp;
+        uint256 disputeDeadline; // set when claimDefault is called
+        uint8   state;
+        string  purpose;
+        address[] vouchers;
+    }
+
+    mapping(uint256 => Loan) public loans;
+    // borrower => array of loanIds
+    mapping(address => uint256[]) public borrowerLoans;
+    // lender => array of loanIds
+    mapping(address => uint256[]) public lenderLoans;
+
+    // ---- Events ----
+    event LoanCreated(uint256 indexed loanId, address indexed borrower, uint256 amount);
+    event LoanFullyVouched(uint256 indexed loanId);
+    event LoanFunded(uint256 indexed loanId, address indexed lender, uint256 amount);
+    event LoanRepaid(uint256 indexed loanId, address indexed borrower, uint256 amount);
+    event DefaultClaimed(uint256 indexed loanId, address indexed lender, uint256 disputeDeadline);
+    event DefaultDisputed(uint256 indexed loanId, address indexed borrower);
+    event DefaultFinalized(uint256 indexed loanId, uint256 slashedAmount);
+
+    constructor(
+        address _vouchPool,
+        address _reputationToken
+    ) Ownable(msg.sender) {
+        vouchPool       = IVouchPool(_vouchPool);
+        reputationToken = IReputationToken(_reputationToken);
+    }
+
+    // ---- BORROWER ACTIONS ----
+
+    function createLoan(
+        uint256 termDays,
+        uint256 interestBps,
+        string calldata purpose,
+        address[] calldata voucherAddresses
+    ) external payable returns (uint256) {
+        // msg.value is 0 here — amount sent by lender later.
+        // We pass the desired loan amount via a separate param trick:
+        // Actually the borrower specifies the amount they want.
+        // We handle this by requiring borrower to pass amount as msg.value = 0
+        // and using a separate amount param. Let me use a cleaner approach:
+        revert("Use createLoanRequest instead");
+    }
+
+    function createLoanRequest(
+        uint256 amount,
+        uint256 termDays,
+        uint256 interestBps,
+        string calldata purpose,
+        address[] calldata voucherAddresses
+    ) external returns (uint256) {
+        require(amount > 0, "Amount must be > 0");
+        require(termDays >= 1 && termDays <= 365, "Term: 1-365 days");
+        require(interestBps >= 100 && interestBps <= 5000, "Interest: 1%-50%");
+        require(voucherAddresses.length >= 2 && voucherAddresses.length <= 3, "2-3 vouchers required");
+
+        uint256 maxLoan = reputationToken.getMaxLoan(msg.sender);
+        require(amount <= maxLoan, "Amount exceeds trust limit");
+
+        // Validate vouchers are not the borrower
+        for (uint i = 0; i < voucherAddresses.length; i++) {
+            require(voucherAddresses[i] != msg.sender, "Cannot vouch for yourself");
+            require(voucherAddresses[i] != address(0), "Invalid voucher address");
+        }
+
+        _loanCounter++;
+        uint256 loanId = _loanCounter;
+
+        loans[loanId] = Loan({
+            id:              loanId,
+            borrower:        msg.sender,
+            lender:          address(0),
+            amount:          amount,
+            termDays:        termDays,
+            interestBps:     interestBps,
+            createdAt:       block.timestamp,
+            fundedAt:        0,
+            dueTimestamp:    0,
+            disputeDeadline: 0,
+            state:           0, // Pending
+            purpose:         purpose,
+            vouchers:        voucherAddresses
+        });
+
+        borrowerLoans[msg.sender].push(loanId);
+
+        // Mint reputation NFT for borrower if they don't have one
+        reputationToken.mintIfNew(msg.sender);
+
+        // Register with VouchPool so vouchers can stake
+        vouchPool.registerLoan(loanId, amount, voucherAddresses);
+
+        emit LoanCreated(loanId, msg.sender, amount);
+        return loanId;
+    }
+
+    // Called by borrower to repay. Must send principal + interest.
+    function repayLoan(uint256 loanId) external payable {
+        Loan storage loan = loans[loanId];
+        require(loan.borrower == msg.sender, "Not the borrower");
+        require(loan.state == 2, "Loan not in Funded state");
+
+        uint256 interest    = (loan.amount * loan.interestBps) / 10000;
+        uint256 totalDue    = loan.amount + interest;
+        require(msg.value >= totalDue, "Insufficient repayment");
+
+        loan.state = 3; // Repaid
+
+        // Release voucher stakes + yield
+        vouchPool.releaseStakes(loanId, interest);
+
+        // Pay lender principal + 70% of interest
+        uint256 lenderPayout = loan.amount + ((interest * 7000) / 10000);
+        (bool ok, ) = payable(loan.lender).call{value: lenderPayout}("");
+        require(ok, "Lender payment failed");
+
+        // Update reputation
+        reputationToken.recordRepayment(loan.borrower, loan.amount);
+
+        // Refund any excess
+        uint256 excess = msg.value - totalDue;
+        if (excess > 0) {
+            (bool refunded, ) = payable(msg.sender).call{value: excess}("");
+            require(refunded, "Refund failed");
+        }
+
+        emit LoanRepaid(loanId, msg.sender, msg.value);
+    }
+
+    // Borrower disputes a default claim within 48hr window
+    function disputeDefault(uint256 loanId) external {
+        Loan storage loan = loans[loanId];
+        require(loan.borrower == msg.sender, "Not the borrower");
+        require(loan.state == 4, "No active default claim");
+        require(block.timestamp < loan.disputeDeadline, "Dispute window closed");
+        // For hackathon: simply resets to Funded state.
+        // In production: would involve arbitration.
+        loan.state = 2;
+        emit DefaultDisputed(loanId, msg.sender);
+    }
+
+    // ---- LENDER ACTIONS ----
+
+    // Lender sends exact loan.amount in ETH to fund the loan
+    function fundLoan(uint256 loanId) external payable {
+        Loan storage loan = loans[loanId];
+        require(loan.state == 1, "Loan not fully vouched");
+        require(msg.value == loan.amount, "Must send exact loan amount");
+        require(loan.lender == address(0), "Already funded");
+
+        loan.lender      = msg.sender;
+        loan.fundedAt    = block.timestamp;
+        loan.dueTimestamp = block.timestamp + (loan.termDays * 1 days);
+        loan.state       = 2; // Funded
+
+        lenderLoans[msg.sender].push(loanId);
+
+        // Send ETH to borrower
+        (bool ok, ) = payable(loan.borrower).call{value: msg.value}("");
+        require(ok, "Borrower payment failed");
+
+        reputationToken.recordBorrow(loan.borrower, loan.amount);
+
+        emit LoanFunded(loanId, msg.sender, msg.value);
+    }
+
+    // Lender claims default after due date
+    function claimDefault(uint256 loanId) external {
+        Loan storage loan = loans[loanId];
+        require(loan.lender == msg.sender, "Not the lender");
+        require(loan.state == 2, "Loan not active");
+        require(block.timestamp > loan.dueTimestamp, "Loan not yet due");
+
+        loan.state           = 4; // DefaultClaimed
+        loan.disputeDeadline = block.timestamp + 48 hours;
+
+        emit DefaultClaimed(loanId, msg.sender, loan.disputeDeadline);
+    }
+
+    // Anyone can call this after dispute window closes
+    function finalizeDefault(uint256 loanId) external {
+        Loan storage loan = loans[loanId];
+        require(loan.state == 4, "Not in default claimed state");
+        require(block.timestamp >= loan.disputeDeadline, "Dispute window still open");
+
+        loan.state = 5; // Defaulted
+
+        uint256 slashed = vouchPool.slashStakes(loanId, payable(loan.lender));
+
+        reputationToken.recordDefault(loan.borrower, loan.amount);
+
+        emit DefaultFinalized(loanId, slashed);
+    }
+
+    // ---- VOUCHER TRIGGERS ----
+
+    // Called after a voucher stakes — checks if loan is now fully covered
+    function checkAndActivate(uint256 loanId) external {
+        Loan storage loan = loans[loanId];
+        require(loan.state == 0, "Not in pending state");
+        if (vouchPool.isSufficientlyCovered(loanId)) {
+            loan.state = 1; // FullyVouched
+            emit LoanFullyVouched(loanId);
+        }
+    }
+
+    // ---- VIEW FUNCTIONS ----
+
+    function getLoan(uint256 loanId) external view returns (Loan memory) {
+        return loans[loanId];
+    }
+
+    function getBorrowerLoans(address borrower) external view returns (uint256[] memory) {
+        return borrowerLoans[borrower];
+    }
+
+    function getLenderLoans(address lender) external view returns (uint256[] memory) {
+        return lenderLoans[lender];
+    }
+
+    function getRepaymentAmount(uint256 loanId) external view returns (uint256) {
+        Loan memory loan = loans[loanId];
+        uint256 interest = (loan.amount * loan.interestBps) / 10000;
+        return loan.amount + interest;
+    }
+
+    function getTotalLoanCount() external view returns (uint256) {
+        return _loanCounter;
+    }
+}
+
+-------------------------------------------------------------
+SECTION 6 — DEPLOY SCRIPT
+-------------------------------------------------------------
+
+File: contracts/scripts/deploy.js
+
+const { ethers } = require("hardhat");
+
+async function main() {
+  console.log("Deploying TrustCircle contracts to Sepolia...");
+
+  // 1. Deploy ReputationToken first (no dependencies)
+  const ReputationToken = await ethers.getContractFactory("ReputationToken");
+  const reputation = await ReputationToken.deploy();
+  await reputation.waitForDeployment();
+  console.log("ReputationToken deployed:", await reputation.getAddress());
+
+  // 2. Deploy VouchPool (needs reputation address)
+  const VouchPool = await ethers.getContractFactory("VouchPool");
+  const vouchPool = await VouchPool.deploy(await reputation.getAddress());
+  await vouchPool.waitForDeployment();
+  console.log("VouchPool deployed:", await vouchPool.getAddress());
+
+  // 3. Deploy LoanRequest (needs vouchPool + reputation)
+  const LoanRequest = await ethers.getContractFactory("LoanRequest");
+  const loanRequest = await LoanRequest.deploy(
+    await vouchPool.getAddress(),
+    await reputation.getAddress()
+  );
+  await loanRequest.waitForDeployment();
+  console.log("LoanRequest deployed:", await loanRequest.getAddress());
+
+  // 4. Wire contracts together
+  await reputation.setAuthorisedContracts(
+    await loanRequest.getAddress(),
+    await vouchPool.getAddress()
+  );
+  await vouchPool.setLoanRequestContract(await loanRequest.getAddress());
+
+  console.log("\n--- COPY THESE INTO frontend/.env ---");
+  console.log("VITE_LOAN_REQUEST_ADDRESS=" + await loanRequest.getAddress());
+  console.log("VITE_VOUCH_POOL_ADDRESS="   + await vouchPool.getAddress());
+  console.log("VITE_REPUTATION_ADDRESS="   + await reputation.getAddress());
+  console.log("VITE_CHAIN_ID=11155111");
+}
+
+main().catch(console.error);
+
+DEPLOY COMMAND (run from contracts/ folder):
+  npx hardhat run scripts/deploy.js --network sepolia
+
+-------------------------------------------------------------
+SECTION 7 — HARDHAT TESTS
+-------------------------------------------------------------
+
+File: contracts/test/TrustCircle.test.js
+
+Write tests covering these three scenarios exactly:
+
+TEST 1 — Happy path (full repayment):
+  - Create loan for 0.05 ETH, 30 days, 10% interest
+  - Two vouchers each stake 0.025 ETH (total 0.05 ETH = 100% coverage, > 80% required)
+  - Call checkAndActivate → state should become FullyVouched (1)
+  - Lender funds loan → state becomes Funded (2), borrower receives 0.05 ETH
+  - Borrower repays 0.055 ETH (principal + interest) → state becomes Repaid (3)
+  - Verify vouchers received their stakes back plus yield
+  - Verify lender received principal plus 70% of interest
+  - Verify borrower repaymentCount increased by 1
+
+TEST 2 — Default + slash:
+  - Create loan, vouch, fund as above
+  - Advance time past due date using hardhat_increaseTime
+  - Lender calls claimDefault → state becomes DefaultClaimed (4)
+  - Advance time 48 hours
+  - Anyone calls finalizeDefault → state becomes Defaulted (5)
+  - Verify lender received the slashed voucher stakes
+  - Verify borrower defaultCount increased by 1
+
+TEST 3 — Max loan cap enforcement:
+  - New wallet with score 0 tries to request 1 ETH loan
+  - Expect revert with "Amount exceeds trust limit"
+  - Confirm max loan for score 0 is 0.05 ETH
+
+RUN TESTS:
+  npx hardhat test
+
+-------------------------------------------------------------
+SECTION 8 — FRONTEND PROJECT SETUP
+-------------------------------------------------------------
+
+  cd trustcircle/frontend
+  npm create vite@latest . -- --template react
+  npm install
+  npm install ethers tailwindcss @tailwindcss/vite react-router-dom
+  npm install react-hot-toast
+
+TAILWIND: Add to vite.config.js:
+  import tailwindcss from '@tailwindcss/vite'
+  export default { plugins: [react(), tailwindcss()] }
+
+Add to src/index.css (replace entire file):
+  @import "tailwindcss";
+
+-------------------------------------------------------------
+SECTION 9 — FRONTEND .env FILE
+-------------------------------------------------------------
+
+File: frontend/.env
+
+  VITE_LOAN_REQUEST_ADDRESS=0x_PASTE_FROM_DEPLOY_OUTPUT
+  VITE_VOUCH_POOL_ADDRESS=0x_PASTE_FROM_DEPLOY_OUTPUT
+  VITE_REPUTATION_ADDRESS=0x_PASTE_FROM_DEPLOY_OUTPUT
+  VITE_CHAIN_ID=11155111
+  VITE_SEPOLIA_RPC=https://eth-sepolia.g.alchemy.com/v2/YOUR_KEY
+  VITE_BLOCK_EXPLORER=https://sepolia.etherscan.io
+
+-------------------------------------------------------------
+SECTION 10 — DESIGN SYSTEM
+-------------------------------------------------------------
+
+ALL DESIGN DECISIONS ARE FINAL. DO NOT CHANGE THEM.
+
+FONTS (import from Google Fonts in index.html):
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,700&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+
+  Headings, logo, hero text    : "Fraunces", serif
+  Body, labels, buttons, nav   : "DM Sans", sans-serif
+  Code, contract addresses     : system monospace
+
+COLOUR PALETTE (use these exact hex values everywhere):
+  Background page              : #F5F3EE  (warm cream)
+  Card / surface               : #FFFFFF
+  Border default               : #D6D3CE
+  Border hover                 : #A8A49E
+
+  Primary brand (teal)         : #00897B
+  Primary dark                 : #00574F
+  Primary light fill           : #E0F2F1
+  Primary text on light fill   : #00574F
+
+  Voucher accent (purple)      : #5C35A8
+  Voucher light fill           : #EDE7F6
+  Voucher text on fill         : #3B1F7A
+
+  Lender accent (amber)        : #D97706
+  Lender light fill            : #FEF3C7
+  Lender text on fill          : #92400E
+
+  Profile accent (blue)        : #1565C0
+  Profile light fill           : #E3F2FD
+  Profile text on fill         : #0D3A7A
+
+  Danger / default             : #D32F2F
+  Danger light fill            : #FFEBEE
+  Success                      : #2E7D32
+  Warning                      : #E65100
+
+  Text primary                 : #1A1A1A
+  Text secondary               : #4B4B4B
+  Text muted                   : #6B6B6B
+  Text disabled                : #9CA3AF
+
+TYPOGRAPHY SCALE:
+  Hero heading                 : Fraunces 48px / 700 / letter-spacing -1px
+  Page heading (h1)            : Fraunces 32px / 600
+  Section heading (h2)         : Fraunces 24px / 600
+  Card heading (h3)            : DM Sans 18px / 600
+  Body                         : DM Sans 16px / 400 / line-height 1.65
+  Label / caption              : DM Sans 13px / 500
+  Badge / chip                 : DM Sans 12px / 600 / uppercase / letter-spacing 0.5px
+  Monospace (addresses)        : system-ui monospace 13px
+
+SPACING: Use multiples of 4px. Standard card padding is 24px.
+BORDER RADIUS: 10px for cards, 8px for buttons, 6px for badges.
+SHADOWS: 0 2px 12px rgba(0,0,0,0.07) for cards.
+
+BUTTONS:
+  Primary   : bg #00897B, text white, hover bg #00574F, rounded-lg, px-6 py-3, font-medium
+  Secondary : bg transparent, border 1.5px #00897B, text #00897B, hover bg #E0F2F1
+  Danger    : bg #D32F2F, text white, hover bg #B71C1C
+  Disabled  : bg #D6D3CE, text #9CA3AF, cursor-not-allowed
+
+STATE BADGES (pill shape, rounded-full):
+  Pending         : bg #FEF3C7 text #92400E
+  FullyVouched    : bg #E0F2F1 text #00574F
+  Funded          : bg #E3F2FD text #0D3A7A
+  Repaid          : bg #DCFCE7 text #14532D
+  DefaultClaimed  : bg #FFEBEE text #B71C1C
+  Defaulted       : bg #D32F2F text white
+
+ANIMATIONS:
+  Page transitions    : opacity 0→1 over 200ms
+  Button hover        : scale 1→1.02 over 150ms
+  Card hover          : translateY 0→-2px, shadow intensify, 150ms
+  Loading spinner     : spinning ring using border-t-transparent trick
+  Toast notifications : slide in from bottom-right, auto-dismiss 4s
+
+-------------------------------------------------------------
+SECTION 11 — SHARED UTILITIES
+-------------------------------------------------------------
+
+File: frontend/src/config/contracts.js
+
+  import LoanRequestABI from '../abis/LoanRequest.json';
+  import VouchPoolABI from '../abis/VouchPool.json';
+  import ReputationABI from '../abis/ReputationToken.json';
+
+  export const CONTRACTS = {
+    loanRequest: {
+      address: import.meta.env.VITE_LOAN_REQUEST_ADDRESS,
+      abi: LoanRequestABI.abi
+    },
+    vouchPool: {
+      address: import.meta.env.VITE_VOUCH_POOL_ADDRESS,
+      abi: VouchPoolABI.abi
+    },
+    reputation: {
+      address: import.meta.env.VITE_REPUTATION_ADDRESS,
+      abi: ReputationABI.abi
+    }
+  };
+
+  export const SEPOLIA_CHAIN_ID = 11155111;
+  export const BLOCK_EXPLORER   = "https://sepolia.etherscan.io";
+
+  export const LOAN_STATES = {
+    0: "Pending",
+    1: "FullyVouched",
+    2: "Funded",
+    3: "Repaid",
+    4: "DefaultClaimed",
+    5: "Defaulted"
+  };
+
+File: frontend/src/utils/formatters.js
+
+  import { ethers } from "ethers";
+
+  export function formatEth(wei) {
+    if (!wei) return "0 ETH";
+    return parseFloat(ethers.formatEther(wei)).toFixed(4) + " ETH";
+  }
+
+  export function truncateAddress(addr) {
+    if (!addr) return "";
+    return addr.slice(0, 6) + "..." + addr.slice(-4);
+  }
+
+  export function formatDate(timestamp) {
+    if (!timestamp || timestamp == 0) return "—";
+    return new Date(Number(timestamp) * 1000).toLocaleDateString("en-IN", {
+      day: "numeric", month: "short", year: "numeric"
+    });
+  }
+
+  export function daysRemaining(dueTimestamp) {
+    const now  = Date.now() / 1000;
+    const diff = Number(dueTimestamp) - now;
+    if (diff <= 0) return "Overdue";
+    const days = Math.floor(diff / 86400);
+    const hrs  = Math.floor((diff % 86400) / 3600);
+    return days > 0 ? `${days}d ${hrs}h` : `${hrs}h`;
+  }
+
+  export function calcRepaymentAmount(loanAmount, interestBps) {
+    const interest = (BigInt(loanAmount) * BigInt(interestBps)) / 10000n;
+    return (BigInt(loanAmount) + interest).toString();
+  }
+
+  export function getScoreColor(score) {
+    if (score <= 33) return "#D32F2F";
+    if (score <= 66) return "#D97706";
+    return "#00897B";
+  }
+
+File: frontend/src/utils/constants.js
+
+  export const MIN_VOUCHERS     = 2;
+  export const MAX_VOUCHERS     = 3;
+  export const MIN_STAKE_PCT    = 80;  // percent of loan covered by all stakes
+  export const MAX_TERM_DAYS    = 365;
+  export const MIN_INTEREST_BPS = 100; // 1%
+  export const MAX_INTEREST_BPS = 5000;// 50%
+  export const DISPUTE_WINDOW_S = 48 * 60 * 60; // 48 hours in seconds
+
+  export const MAX_LOAN_BY_SCORE = {
+    0:   "0.05",
+    20:  "0.2",
+    50:  "0.5",
+    100: "1.0"
+  };
+
+-------------------------------------------------------------
+SECTION 12 — WALLET CONTEXT + HOOKS
+-------------------------------------------------------------
+
+File: frontend/src/context/WalletContext.jsx
+
+  Create a React context that provides:
+    - address (string | null)
+    - balance (string in ETH)
+    - provider (ethers.BrowserProvider | null)
+    - signer (ethers.Signer | null)
+    - isConnected (boolean)
+    - isCorrectNetwork (boolean) — true only if chainId == 11155111
+    - connect() — calls window.ethereum.request({method: 'eth_requestAccounts'})
+    - disconnect() — clears state
+    - switchToSepolia() — calls wallet_switchEthereumChain for Sepolia
+
+  Listen to: accountsChanged, chainChanged events on window.ethereum.
+  On mount: check if already connected (eth_accounts).
+  Wrap the entire app in <WalletProvider> in main.jsx.
+
+File: frontend/src/hooks/useWallet.js
+  export default function useWallet() { return useContext(WalletContext); }
+
+File: frontend/src/hooks/useLoanRequest.js
+
+  Returns these functions. Each function creates a contract
+  instance using the signer from WalletContext and calls the
+  appropriate contract method. All write functions:
+    1. Call the contract method
+    2. await tx.wait()
+    3. Return the receipt
+
+  Functions to implement:
+    createLoanRequest(amount, termDays, interestBps, purpose, voucherAddresses)
+      — amount is a string like "0.05", convert to wei with ethers.parseEther
+      — interestBps is a number like 1000 for 10%
+      — returns loanId from LoanCreated event in the receipt
+
+    getLoan(loanId)
+      — reads loan struct from contract
+      — returns the Loan object
+
+    repayLoan(loanId)
+      — first reads getRepaymentAmount(loanId) from contract
+      — sends that exact value as msg.value
+
+    fundLoan(loanId, loanAmountWei)
+      — sends loanAmountWei as msg.value
+
+    claimDefault(loanId)
+    finalizeDefault(loanId)
+    disputeDefault(loanId)
+    checkAndActivate(loanId)
+    getBorrowerLoans(address)
+    getLenderLoans(address)
+    getRepaymentAmount(loanId) — returns wei string
+
+File: frontend/src/hooks/useVouchPool.js
+
+  Functions:
+    stake(loanId, amountEth)
+      — converts amountEth string to wei, sends as msg.value
+      — after tx confirmed, call loanRequest.checkAndActivate(loanId)
+
+    getVouchers(loanId) — returns array of VoucherInfo structs
+    getTotalStaked(loanId) — returns wei string
+    getStakesByVoucher(address) — returns array of loanIds
+
+File: frontend/src/hooks/useReputation.js
+
+  Functions:
+    getScore(address) — returns number 0-100
+    getMaxLoan(address) — returns ETH string
+    getProfile(address) — returns Profile struct
+    hasToken(address) — returns boolean
+
+-------------------------------------------------------------
+SECTION 13 — SHARED COMPONENTS
+-------------------------------------------------------------
+
+File: frontend/src/components/layout/Navbar.jsx
+
+  DESIGN:
+    - Background: #FFFFFF, border-bottom 1px #D6D3CE
+    - Height 64px
+    - Left: TrustCircle logo — Fraunces font, teal colour, with a
+      small circular icon (two overlapping circles, teal, representing
+      trust network)
+    - Centre: navigation links — Borrow, Vouch, Lend, Stats
+      Each link is DM Sans 15px, text #4B4B4B, active = #00897B
+      with an underline border-bottom 2px #00897B
+    - Right: NotificationBell + WalletBar
+    - Mobile: hamburger menu collapses nav links
+
+File: frontend/src/components/layout/WalletBar.jsx
+
+  DESIGN:
+    - If not connected: primary button "Connect Wallet"
+    - If connected:
+        pill shape, bg #F5F3EE, border #D6D3CE
+        Left: green dot (8px, #2E7D32) if correct network, red if wrong
+        Middle: truncated address (DM Sans mono 13px)
+        Right: ETH balance (DM Sans 13px, text #00574F, "0.0000 ETH")
+        Click: dropdown with "View Profile" and "Disconnect"
+
+File: frontend/src/components/layout/NotificationBell.jsx
+
+  DESIGN:
+    - Bell icon (24px, #6B6B6B)
+    - Red badge with count if unread > 0
+    - Dropdown on click: list of notifications
+    - Notifications come from filtering contract events for connected wallet
+    - Types: vouch_request, repayment_due (within 3 days), stake_released, slashed
+    - Each notification: icon + one-line description + time ago + link
+
+File: frontend/src/components/common/NetworkGuard.jsx
+
+  DESIGN:
+    - Full-screen overlay (not a modal) when wrong network
+    - Semi-transparent dark backdrop
+    - Centre card: Fraunces heading "Wrong Network",
+      body text "TrustCircle runs on Ethereum Sepolia testnet.",
+      primary button "Switch to Sepolia"
+    - Button calls switchToSepolia() from WalletContext
+    - Do NOT render page content behind this — block it completely
+
+File: frontend/src/components/common/TxToast.jsx
+
+  Use react-hot-toast. Configure a custom toaster:
+  - Position: bottom-right
+  - Three states shown as different toasts:
+      Pending  : spinner + "Transaction submitted..." (persistent until confirmed)
+      Success  : checkmark + "Confirmed!" + "View on Etherscan" link (4s)
+      Error    : X + abbreviated error message (6s)
+  - Export a useTxToast() hook that wraps any contract call:
+      async function withToast(txPromise) {
+        const toastId = toast.loading("Submitting...");
+        try {
+          const tx  = await txPromise;
+          toast.loading("Confirming...", { id: toastId });
+          const rec = await tx.wait();
+          toast.success("Confirmed!", { id: toastId });
+          return rec;
+        } catch (err) {
+          toast.error(err.reason || "Transaction failed", { id: toastId });
+          throw err;
+        }
+      }
+
+File: frontend/src/components/common/TrustMeter.jsx
+
+  Props: score (0-100), size ("sm" | "md" | "lg")
+
+  DESIGN:
+    - SVG semicircular gauge (180° arc)
+    - Background arc: #D6D3CE, strokeWidth 10
+    - Filled arc: colour from getScoreColor(score), animated on mount
+    - Centre number: Fraunces, size depends on prop
+    - Below number: label "Trust Score"
+    - Sizes: sm = 80px diameter, md = 120px, lg = 160px
+    - Animate: arc length from 0 to score% over 800ms on first render
+    - Tooltip on hover: shows score components breakdown
+
+  IMPLEMENTATION NOTE for SVG arc math:
+    radius     = 40 (for md size)
+    circumference = Math.PI * radius  (half circle)
+    dashOffset = circumference * (1 - score/100)
+    Use stroke-dasharray={circumference} stroke-dashoffset={dashOffset}
+    Rotate the arc -180deg around the centre so it fills left to right
+
+File: frontend/src/components/common/LoanCard.jsx
+
+  Props: loan (Loan object), role ("borrower" | "lender" | "browse")
+
+  DESIGN:
+    - White card, 10px radius, shadow, hover lifts 2px
+    - Top-left: loan amount (Fraunces 20px, teal)
+    - Top-right: StateBadge component showing current state
+    - Middle row: three info chips — Term, Interest Rate, Vouchers staked
+    - Bottom: borrower address (truncated, monospace) + due date
+    - If role="browse": show "Fund Loan" button on hover
+    - If role="borrower": show "Repay" button if state=Funded
+    - If role="lender": show "Claim Default" if overdue
+
+File: frontend/src/components/common/StatusBadge.jsx
+
+  Props: state (number 0-5)
+  Renders a pill badge using the LOAN_STATES map and the
+  colour system defined in SECTION 10.
+
+File: frontend/src/components/common/CountdownTimer.jsx
+
+  Props: dueTimestamp (unix seconds)
+  Real-time countdown updating every second.
+  Shows: "Xd Yh Zm" or "OVERDUE" in red with pulsing animation.
+
+File: frontend/src/components/reputation/ReputationCard.jsx
+
+  Props: address, score, profile (Profile struct)
+
+  DESIGN:
+    - Full-width card with teal gradient strip at top (8px)
+    - Left half: TrustMeter (lg size), score number, "Trust Score" label
+    - Right half: four stat rows
+        Loans repaid    : profile.repaymentCount
+        Total repaid    : formatEth(profile.totalRepaid)
+        Vouches made    : profile.vouchCount
+        Voucher accuracy: (successfulVouches/vouchCount * 100).toFixed(0) + "%"
+    - Bottom: wallet address (monospace, copyable), date member since
+
+-------------------------------------------------------------
+SECTION 14 — PAGES: BORROWER
+-------------------------------------------------------------
+
+File: frontend/src/pages/borrow/NewLoan.jsx  (route: /borrow/new)
+
+  DESIGN: Multi-step form, 3 steps with a progress indicator at top.
+
+  STEP 1 — Loan Details:
+    - Input: Loan Amount (ETH) — number input with ETH suffix
+      Below input show: "Your max loan: X ETH" fetched from getMaxLoan()
+      Show warning if entered amount > max
+    - Input: Loan Term — slider OR number input, 1-365 days
+    - Input: Interest Rate — slider, 1%-50%, shows estimated cost
+    - Textarea: Purpose — max 140 characters, character counter
+    - "Next" button — disabled if validation fails
+
+  STEP 2 — Invite Vouchers:
+    - Heading: "Who do you trust to vouch for you?"
+    - Add 2-3 wallet address inputs dynamically
+    - Each input: validate it is a valid ETH address on blur
+    - Validate none of them is the borrower's own address
+    - "Add another voucher" button (max 3)
+    - "Next" button
+
+  STEP 3 — Review & Sign:
+    - Full summary of the loan terms
+    - Note: "Vouchers will receive [X]% APY for staking"
+    - Note: "If you default, your vouchers will lose their stake"
+    - Primary button: "Create Loan Request"
+    - On click: calls createLoanRequest(), shows pending toast
+    - On success: redirect to /borrow/:loanId
+
+File: frontend/src/pages/borrow/LoanStatus.jsx  (route: /borrow/:loanId)
+
+  Fetches loan data every 12 seconds (one Sepolia block interval).
+
+  DESIGN:
+    - Top: loan amount (large, Fraunces), StateBadge
+    - State progress bar: 5 steps (Pending → Vouched → Funded → Repaid)
+      Current step highlighted in teal. Completed steps have checkmarks.
+    - Voucher section: list of invited vouchers
+      Each shows: truncated address, staked amount (or "Awaiting stake")
+      Green check if staked, grey clock if not yet
+    - If state=Funded: show CountdownTimer to due date + "Repay Now" CTA
+    - If state=DefaultClaimed: show red alert banner + dispute button
+    - If state=Repaid: show green success state with confetti animation
+
+File: frontend/src/pages/borrow/Repay.jsx  (route: /borrow/:loanId/repay)
+
+  DESIGN:
+    - Breakdown card:
+        Principal   : X ETH
+        Interest    : X ETH  (calculated as amount * interestBps / 10000)
+        Total Due   : X ETH  (bold, teal)
+        Due Date    : formatted date
+        Time left   : CountdownTimer
+    - Large primary button "Repay X ETH"
+    - Warning if overdue: red banner "Loan is overdue — repay immediately"
+    - On click: calls repayLoan(), exact ETH value sent as msg.value
+
+File: frontend/src/pages/borrow/Dispute.jsx  (route: /borrow/:loanId/dispute)
+
+  DESIGN:
+    - Red alert card explaining default was claimed
+    - CountdownTimer showing time remaining in 48hr window
+    - Textarea: dispute reason (stored off-chain — just for UI; contract
+      records the dispute on-chain with no reason string for hackathon)
+    - Button "Submit Dispute" → calls disputeDefault(loanId)
+    - On success: redirect to /borrow/:loanId
+
+-------------------------------------------------------------
+SECTION 15 — PAGES: VOUCHER
+-------------------------------------------------------------
+
+File: frontend/src/pages/vouch/Inbox.jsx  (route: /vouch/inbox)
+
+  On mount: query VouchPool for VouchRequested events where
+  voucher == connectedAddress. For each loanId, fetch loan data.
+
+  DESIGN:
+    - Heading: "Vouch Requests" with count badge
+    - Empty state: "No pending vouch requests. Your network will
+      reach out when they need your support."
+    - Each request card:
+        Top: Borrower address + their TrustMeter (sm)
+        Middle: loan amount, term, interest rate, purpose note
+        Bottom: two buttons — "Stake & Support" (teal) | "Decline" (ghost)
+        "Stake & Support" links to /vouch/:loanId/stake
+
+File: frontend/src/pages/vouch/StakeETH.jsx  (route: /vouch/:loanId/stake)
+
+  DESIGN:
+    - Left panel: loan summary (borrower, amount, term, interest)
+    - Right panel: staking panel
+        Your ETH balance: shown
+        Minimum stake required: shown (totalStaked shows progress toward 80%)
+        Progress bar: how much of the 80% is already covered
+        Input: "Your stake amount (ETH)"
+        Below input: "Projected yield: X ETH" (updates live as user types)
+          yield = (stakeAmount / totalLoanAmount) * (interest * 30%)
+        Checkbox: "I understand I will lose this stake if the borrower defaults"
+        Primary button: "Stake ETH"
+    - On confirm: calls stake(loanId), then checkAndActivate(loanId)
+    - On success: redirect to /vouch/active
+
+File: frontend/src/pages/vouch/ActiveVouches.jsx  (route: /vouch/active)
+
+  DESIGN:
+    - Summary row at top: total staked, projected total yield, active loans
+    - List of loan cards:
+        Loan amount, borrower (truncated), your stake, projected yield
+        Health dot: green=on track, yellow=due within 7 days, red=overdue
+        CountdownTimer to due date
+    - If any loan has state=DefaultClaimed: red warning banner on that card
+      "Borrower defaulted. Dispute window: X hours remaining."
+
+-------------------------------------------------------------
+SECTION 16 — PAGES: LENDER
+-------------------------------------------------------------
+
+File: frontend/src/pages/lend/BrowseLoans.jsx  (route: /lend/browse)
+
+  On mount: fetch all LoanCreated events from block 0, get loan data
+  for each, filter to only state == 1 (FullyVouched).
+
+  DESIGN:
+    - Filter bar: min trust score slider, max loan size, interest rate range
+    - Sort buttons: "Highest Interest" | "Highest Trust Score" | "Newest"
+    - Grid of LoanCard components (role="browse")
+    - Empty state: "No fully-vouched loans available. Check back soon."
+    - Each card links to /lend/:loanId
+
+File: frontend/src/pages/lend/LoanDetail.jsx  (route: /lend/:loanId)
+
+  DESIGN:
+    - Left column (60%):
+        Borrower section:
+          Address, TrustMeter (md), score breakdown
+          Repayment history (repaymentCount, defaultCount)
+          First loan date
+        Loan terms:
+          Amount, term, interest rate, purpose note
+          Total repayment amount, due date if funded
+        Voucher section:
+          List of vouchers with their staked amounts
+          Each shows: address, TrustMeter (sm), stake amount
+          Progress bar: total staked as % of loan (with 80% minimum marker)
+
+    - Right column (40%):
+        Sticky funding card:
+          Loan amount: X ETH (large, Fraunces)
+          Interest earned: X ETH
+          Total returned: X ETH
+          Lender's risk exposure: X ETH (loan - stakes = max loss)
+          Primary button "Fund This Loan"
+          Small print: "By funding, you accept the loan terms"
+        On click: calls fundLoan(loanId) with exact loan.amount as msg.value
+
+File: frontend/src/pages/lend/Portfolio.jsx  (route: /lend/portfolio)
+
+  DESIGN:
+    - Summary stats row:
+        Total deployed, total earned, active loans, completed loans
+    - Three sections with toggle tabs: Active | Repaid | Defaulted
+    - Each loan: LoanCard (role="lender")
+    - "Claim Default" button appears on overdue active loans
+
+-------------------------------------------------------------
+SECTION 17 — PAGES: PROFILE & STATS
+-------------------------------------------------------------
+
+File: frontend/src/pages/profile/Profile.jsx  (route: /profile/:address)
+
+  If no :address param, show the connected wallet's profile.
+
+  DESIGN:
+    - Top banner: teal gradient strip, wallet address (monospace),
+      "Member since: X" using NFT mintedAt timestamp
+    - Main content: ReputationCard component
+    - Below: two tabs — "Borrow History" | "Vouch History"
+      Borrow History: list of loans, state, amount, date
+      Vouch History: list of loans vouched, outcome, stake, yield/loss
+    - Shareable link button: copies /profile/:address to clipboard
+
+File: frontend/src/pages/profile/Stats.jsx  (route: /stats)
+
+  DESIGN:
+    - Four large stat cards (teal fills):
+        Total loans created (count LoanCreated events)
+        Total ETH lent (sum of all funded amounts)
+        Platform repayment rate (Repaid / (Repaid + Defaulted) * 100)%
+        Total vouchers active
+    - Simple table: recent loan activity (last 10 events from contract)
+
+-------------------------------------------------------------
+SECTION 18 — PAGES: LANDING
+-------------------------------------------------------------
+
+File: frontend/src/pages/Landing.jsx  (route: /)
+
+  DESIGN:
+
+  HERO SECTION:
+    - Full viewport height
+    - Background: #F5F3EE
+    - Left half: text content
+        Eyebrow text (DM Sans 13px, teal, uppercase, letter-spacing 2px):
+          "SOCIAL-VOUCHED MICRO-LENDING"
+        Headline (Fraunces 52px, 700, #1A1A1A, letter-spacing -1px):
+          "Borrow with trust.
+           Not with crypto."
+        Subheading (DM Sans 18px, #4B4B4B, line-height 1.7):
+          "1.4 billion people are unbanked — not because they're
+           untrustworthy, but because no institution knows them.
+           TrustCircle lets your community vouch for you on-chain."
+        Two buttons:
+          Primary: "Start Borrowing" → /borrow/new
+          Secondary: "Fund a Loan" → /lend/browse
+    - Right half: animated network diagram (SVG, hand-drawn style)
+        Show borrower node in centre (teal circle)
+        2-3 voucher nodes connected with lines (purple circles)
+        1 lender node (amber circle)
+        Pulsing animation on connection lines (stroke-dashoffset animation)
+
+  HOW IT WORKS SECTION:
+    - Light teal background strip
+    - Fraunces heading: "How TrustCircle works"
+    - Three columns with large step numbers (Fraunces, 80px, very light teal):
+        1. Request a loan — "Describe what you need and invite 2-3 people from your network."
+        2. Your network vouches — "Trusted contacts stake ETH on your behalf. Skin in the game."
+        3. Get funded — "Lenders see your community's trust. Repay and your reputation grows."
+
+  STATS SECTION (fetch from contract):
+    - Dark background (#1A1A1A)
+    - Three numbers in Fraunces: loans funded, ETH deployed, repayment rate
+    - Animated count-up on scroll into view
+
+  FOOTER:
+    - Simple. Logo, three nav links, "Built on Ethereum Sepolia"
+    - DM Sans 14px, text #6B6B6B
+
+-------------------------------------------------------------
+SECTION 19 — APP ROUTER SETUP
+-------------------------------------------------------------
+
+File: frontend/src/App.jsx
+
+  import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+  import { Toaster } from "react-hot-toast";
+  import { WalletProvider } from "./context/WalletContext";
+  import Navbar from "./components/layout/Navbar";
+  import NetworkGuard from "./components/common/NetworkGuard";
+
+  // Import all page components
+
+  // AuthRequired: wraps routes that need wallet connected
+  function AuthRequired({ children }) {
+    const { isConnected } = useWallet();
+    if (!isConnected) return <Navigate to="/" />;
+    return children;
+  }
+
+  export default function App() {
+    return (
+      <WalletProvider>
+        <BrowserRouter>
+          <Navbar />
+          <NetworkGuard />
+          <Toaster position="bottom-right" />
+          <Routes>
+            <Route path="/" element={<Landing />} />
+            <Route path="/stats" element={<Stats />} />
+            <Route path="/profile/:address" element={<Profile />} />
+            <Route path="/profile" element={<AuthRequired><Profile /></AuthRequired>} />
+
+            <Route path="/borrow" element={<AuthRequired><BorrowHome /></AuthRequired>} />
+            <Route path="/borrow/new" element={<AuthRequired><NewLoan /></AuthRequired>} />
+            <Route path="/borrow/:loanId" element={<AuthRequired><LoanStatus /></AuthRequired>} />
+            <Route path="/borrow/:loanId/repay" element={<AuthRequired><Repay /></AuthRequired>} />
+            <Route path="/borrow/:loanId/dispute" element={<AuthRequired><Dispute /></AuthRequired>} />
+
+            <Route path="/vouch" element={<AuthRequired><VouchHome /></AuthRequired>} />
+            <Route path="/vouch/inbox" element={<AuthRequired><Inbox /></AuthRequired>} />
+            <Route path="/vouch/:loanId/stake" element={<AuthRequired><StakeETH /></AuthRequired>} />
+            <Route path="/vouch/active" element={<AuthRequired><ActiveVouches /></AuthRequired>} />
+            <Route path="/vouch/history" element={<AuthRequired><VouchHistory /></AuthRequired>} />
+
+            <Route path="/lend" element={<AuthRequired><LendHome /></AuthRequired>} />
+            <Route path="/lend/browse" element={<LendBrowse />} />
+            <Route path="/lend/:loanId" element={<LoanDetail />} />
+            <Route path="/lend/portfolio" element={<AuthRequired><Portfolio /></AuthRequired>} />
+            <Route path="/lend/:loanId/default" element={<AuthRequired><ClaimDefault /></AuthRequired>} />
+          </Routes>
+        </BrowserRouter>
+      </WalletProvider>
+    );
+  }
+
+-------------------------------------------------------------
+SECTION 20 — ABI COPY STEP
+-------------------------------------------------------------
+
+After running "npx hardhat compile" in the contracts/ folder,
+copy the ABI files into the frontend:
+
+  From: contracts/artifacts/contracts/LoanRequest.sol/LoanRequest.json
+  To:   frontend/src/abis/LoanRequest.json
+
+  From: contracts/artifacts/contracts/VouchPool.sol/VouchPool.json
+  To:   frontend/src/abis/VouchPool.json
+
+  From: contracts/artifacts/contracts/ReputationToken.sol/ReputationToken.json
+  To:   frontend/src/abis/ReputationToken.json
+
+You only need the ABI array inside each JSON file. The full
+artifact file also works — ethers.js can read it either way
+as long as you reference .abi when creating a contract instance:
+
+  const contract = new ethers.Contract(address, abi.abi, signer);
+
+-------------------------------------------------------------
+SECTION 21 — GET TEST ETH FOR SEPOLIA
+-------------------------------------------------------------
+
+The deployer wallet and all test wallets need Sepolia ETH.
+It is free. Get it from:
+  https://sepoliafaucet.com       (requires Alchemy account)
+  https://www.infura.io/faucet    (requires Infura account)
+  https://faucet.quicknode.com    (no account needed, 0.1 ETH)
+
+Get test ETH for at least 3 wallets:
+  Wallet 1 (deployer + borrower)
+  Wallet 2 (voucher 1)
+  Wallet 3 (lender)
+
+-------------------------------------------------------------
+SECTION 22 — BUILD ORDER FOR AGENT
+-------------------------------------------------------------
+
+Follow this order strictly. Do not move to a later step until
+the current step is working and verified.
+
+PHASE 1 — CONTRACTS (complete before any frontend)
+  Step 1.1  Write ReputationToken.sol exactly as in Section 3
+  Step 1.2  Write VouchPool.sol exactly as in Section 4
+  Step 1.3  Write LoanRequest.sol exactly as in Section 5
+  Step 1.4  Run: npx hardhat compile — fix all compiler errors
+  Step 1.5  Write test file as described in Section 7
+  Step 1.6  Run: npx hardhat test — all 3 tests must pass
+  Step 1.7  Set up contracts/.env with real Sepolia RPC URL
+  Step 1.8  Run deploy script — save all 3 contract addresses
+
+PHASE 2 — FRONTEND FOUNDATION
+  Step 2.1  Scaffold Vite React project as in Section 8
+  Step 2.2  Copy ABIs as described in Section 20
+  Step 2.3  Create config/contracts.js and both utils files
+  Step 2.4  Build WalletContext — test MetaMask connect works
+  Step 2.5  Build NetworkGuard — test it appears on wrong network
+  Step 2.6  Build TxToast — verify toast appears on tx
+
+PHASE 3 — CORE LOOP (P0 — must demo)
+  Step 3.1  Build NewLoan.jsx — test creating a loan on Sepolia
+  Step 3.2  Build StakeETH.jsx — test staking from a second wallet
+  Step 3.3  Build LoanDetail.jsx + BrowseLoans.jsx — test funding
+  Step 3.4  Build Repay.jsx — test full repayment
+  Step 3.5  Verify full happy path end-to-end on Sepolia
+
+PHASE 4 — SUPPORTING FEATURES (P1)
+  Step 4.1  Build TrustMeter.jsx + Profile.jsx
+  Step 4.2  Build LoanStatus.jsx with state machine progress bar
+  Step 4.3  Build ActiveVouches.jsx + Portfolio.jsx
+  Step 4.4  Build Navbar + NotificationBell
+  Step 4.5  Build Landing.jsx
+
+PHASE 5 — POLISH (P2 — only if time allows)
+  Step 5.1  Dispute.jsx + ClaimDefault.jsx
+  Step 5.2  VouchHistory.jsx + LoanHistory.jsx
+  Step 5.3  Stats.jsx
+  Step 5.4  Mobile responsive fixes
+  Step 5.5  Animations and hover states
+
+-------------------------------------------------------------
+SECTION 23 — CRITICAL RULES FOR AGENT
+-------------------------------------------------------------
+
+1. NEVER write a backend server. No Express. No Node API.
+   No database. All state is on-chain.
+
+2. NEVER store private keys in the frontend. The user's
+   MetaMask wallet handles all signing. Never ask for a
+   private key in the UI.
+
+3. ALL contract interactions that write state (create loan,
+   stake, fund, repay) must go through ethers.js with the
+   user's MetaMask signer. Read-only calls use the provider.
+
+4. ALWAYS show a loading state while a transaction is pending.
+   Transactions on Sepolia take 12-30 seconds to confirm.
+   Never leave the user staring at a blank screen.
+
+5. ALWAYS handle errors from MetaMask. Common errors:
+     - User rejected transaction → show friendly message
+     - Insufficient funds → "Not enough ETH in your wallet"
+     - Contract revert → parse err.reason and show it
+
+6. ALWAYS validate loan amount against getMaxLoan() BEFORE
+   calling createLoanRequest. Showing a revert error is
+   confusing. Pre-validate in the UI.
+
+7. When calling checkAndActivate() after a stake, the loan
+   may or may not become FullyVouched. Poll getLoan() for
+   1-2 seconds after the tx to update the UI.
+
+8. Addresses in Solidity are checksummed. Always pass
+   addresses through ethers.getAddress(addr) before sending
+   to a contract to avoid checksum errors.
+
+9. BigInt vs number: ethers.js v6 returns BigInt for uint256
+   values. Use Number() or .toString() before rendering.
+   Never do arithmetic on BigInt and number directly.
+
+10. The ABI files must match the deployed contract exactly.
+    If you change a contract and redeploy, recompile and
+    recopy the ABI files. Stale ABIs cause silent failures.
+
+11. Follow the design system in Section 10 exactly.
+    Do not use Inter, Roboto, or Arial.
+    Do not use purple gradients on white backgrounds.
+    Use the exact hex values specified.
+
+12. All sensitive values go in .env files.
+    .env files go in .gitignore immediately.
+    Never hardcode contract addresses in source files.
+
+-------------------------------------------------------------
+END OF AGENTS.txt
+=============================================================
